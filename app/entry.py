@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders
+from app.store import batches, orders
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -30,6 +30,14 @@ class PaymentIn(BaseModel):
 class ReversalIn(BaseModel):
     reversal_id: str = Field(min_length=1)
     request_fingerprint: str = Field(min_length=1)
+
+class BatchIn(BaseModel):
+    # 批次级字段：缺批次标识或指纹（含空串）按参数不合法 400 拒绝，不落任何数据。
+    # 行内容逐行校验（行级拒绝只影响本行），故 items 元素在此不加约束。
+    tenant: str = Field(min_length=1)
+    batch_id: str = Field(min_length=1)
+    request_fingerprint: str = Field(min_length=1)
+    items: list[dict] = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -60,6 +68,22 @@ def create_order(body: OrderIn, response: Response) -> dict:
     if replayed:
         response.headers["X-Idempotency-Replay"] = "true"
     return order
+
+@app.post("/orders/batch")
+def accept_batch(body: BatchIn, response: Response) -> dict:
+    try:
+        result, replayed = batches.accept_batch(
+            body.tenant,
+            body.batch_id,
+            body.request_fingerprint,
+            body.items,
+        )
+    except batches.BatchFingerprintConflict:
+        # 批次标识被复用于不同业务内容：与行级各拒绝（在结果清单内按行定位）明确区分。
+        raise HTTPException(status_code=422, detail="batch id reused with a different request fingerprint")
+    if replayed:
+        response.headers["X-Idempotency-Replay"] = "true"
+    return result
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:

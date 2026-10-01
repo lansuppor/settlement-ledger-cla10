@@ -36,51 +36,72 @@ def accept_order(
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        recorded = conn.execute(
-            "SELECT request_fingerprint, response_snapshot FROM accepted_requests "
-            "WHERE tenant=? AND idempotency_key=?",
-            (tenant, idempotency_key),
-        ).fetchone()
-        if recorded is not None:
-            # 幂等键已消费：只比对指纹，绝不改写首次受理的任何记录。
+        try:
+            order, replayed = accept_order_in_tx(
+                conn, tenant, idempotency_key, request_fingerprint, order_id, amount_cents, currency
+            )
+        except BaseException:
             conn.execute("ROLLBACK")
-            if recorded["request_fingerprint"] != request_fingerprint:
-                raise FingerprintConflict
-            return json.loads(recorded["response_snapshot"]), True
-
-        if conn.execute(
-            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
-            (tenant, order_id),
-        ).fetchone() is not None:
-            conn.execute("ROLLBACK")
-            raise OrderAlreadyAccepted
-
-        conn.execute(
-            "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) "
-            "VALUES(?,?,?,0,?,'accepted')",
-            (tenant, order_id, amount_cents, currency),
-        )
-        order = {
-            "tenant": tenant,
-            "order_id": order_id,
-            "amount_cents": amount_cents,
-            "paid_cents": 0,
-            "currency": currency,
-            "status": "accepted",
-            "outstanding_cents": amount_cents,
-        }
-        conn.execute(
-            "INSERT INTO accepted_requests(tenant, idempotency_key, request_fingerprint, order_id, response_snapshot) "
-            "VALUES(?,?,?,?,?)",
-            (tenant, idempotency_key, request_fingerprint, order_id, json.dumps(order, ensure_ascii=False)),
-        )
+            raise
         if os.environ.get("APP_CRASH_BEFORE_COMMIT") == "1":
             # 崩溃演练：不提交直接硬退出，未提交事务随连接被丢弃。
             os._exit(2)
         conn.execute("COMMIT")
-        return order, False
+        return order, replayed
     finally:
         conn.close()
+
+
+def accept_order_in_tx(
+    conn: sqlite3.Connection,
+    tenant: str,
+    idempotency_key: str,
+    request_fingerprint: str,
+    order_id: str,
+    amount_cents: int,
+    currency: str,
+) -> tuple[dict, bool]:
+    """在调用方持有的事务内受理一单（单笔入口与批量逐行受理共用同一套判定）。
+
+    幂等键已消费时只比对指纹，绝不改写首次受理的任何记录；
+    订单写入与幂等记录写入由调用方的事务保证原子提交。
+    """
+    recorded = conn.execute(
+        "SELECT request_fingerprint, response_snapshot FROM accepted_requests "
+        "WHERE tenant=? AND idempotency_key=?",
+        (tenant, idempotency_key),
+    ).fetchone()
+    if recorded is not None:
+        if recorded["request_fingerprint"] != request_fingerprint:
+            raise FingerprintConflict
+        return json.loads(recorded["response_snapshot"]), True
+
+    if conn.execute(
+        "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+        (tenant, order_id),
+    ).fetchone() is not None:
+        raise OrderAlreadyAccepted
+
+    conn.execute(
+        "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) "
+        "VALUES(?,?,?,0,?,'accepted')",
+        (tenant, order_id, amount_cents, currency),
+    )
+    order = {
+        "tenant": tenant,
+        "order_id": order_id,
+        "amount_cents": amount_cents,
+        "paid_cents": 0,
+        "currency": currency,
+        "status": "accepted",
+        "outstanding_cents": amount_cents,
+    }
+    conn.execute(
+        "INSERT INTO accepted_requests(tenant, idempotency_key, request_fingerprint, order_id, response_snapshot) "
+        "VALUES(?,?,?,?,?)",
+        (tenant, idempotency_key, request_fingerprint, order_id, json.dumps(order, ensure_ascii=False)),
+    )
+    return order, False
 
 
 def get(tenant: str, order_id: str) -> dict | None:
