@@ -1,18 +1,28 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from app.config import tenant_header
+
+from app.rules import order_rules
 from app.store import orders
 from app.store.db import connect, migrate
-from app.rules import order_rules
 
 app = FastAPI(title="settlement-ledger")
+
+@app.exception_handler(RequestValidationError)
+def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    # 参数不合法（含缺少幂等键/指纹）一律 400，不落任何数据。
+    return JSONResponse(status_code=400, content={"detail": {"error": "invalid request", "fields": exc.errors()}})
 
 class OrderIn(BaseModel):
     tenant: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
     currency: str = Field(min_length=3, max_length=3)
+    idempotency_key: str = Field(min_length=1)
+    request_fingerprint: str = Field(min_length=1)
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
@@ -27,15 +37,25 @@ def health() -> dict:
     return {"status": "ok"}
 
 @app.post("/orders", status_code=201)
-def create_order(body: OrderIn) -> dict:
+def create_order(body: OrderIn, response: Response) -> dict:
     order_rules.assert_currency(body.currency)
     try:
-        orders.insert(body.tenant, body.order_id, body.amount_cents, body.currency)
-    except Exception as error:
-        if "UNIQUE" in str(error):
-            raise HTTPException(status_code=409, detail="order already accepted")
-        raise
-    return orders.get(body.tenant, body.order_id)
+        order, replayed = orders.accept_order(
+            body.tenant,
+            body.idempotency_key,
+            body.request_fingerprint,
+            body.order_id,
+            body.amount_cents,
+            body.currency,
+        )
+    except orders.FingerprintConflict:
+        # 幂等键被复用给不同业务内容：与订单重复受理明确区分。
+        raise HTTPException(status_code=422, detail="idempotency key reused with a different request fingerprint")
+    except orders.OrderAlreadyAccepted:
+        raise HTTPException(status_code=409, detail="order already accepted")
+    if replayed:
+        response.headers["X-Idempotency-Replay"] = "true"
+    return order
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:
