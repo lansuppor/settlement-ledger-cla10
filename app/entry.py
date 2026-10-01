@@ -27,6 +27,10 @@ class OrderIn(BaseModel):
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
 
+class ReversalIn(BaseModel):
+    reversal_id: str = Field(min_length=1)
+    request_fingerprint: str = Field(min_length=1)
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -78,6 +82,34 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.get("/payments/{payment_id}")
+def read_payment(payment_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    payment = orders.get_payment(x_tenant, payment_id)
+    if payment is None:
+        # 跨租户与不存在统一 404，不泄漏收款是否存在。
+        raise HTTPException(status_code=404, detail="payment not found")
+    return payment
+
+@app.post("/payments/{payment_id}/reversal")
+def reverse_payment(payment_id: str, body: ReversalIn, response: Response, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = orders.reverse_payment(x_tenant, payment_id, body.reversal_id, body.request_fingerprint)
+    except orders.FingerprintConflict:
+        # 冲正标识被复用给不同业务内容：与收款已冲正（409）明确区分。
+        raise HTTPException(status_code=422, detail="reversal id reused with a different request fingerprint")
+    except orders.PaymentAlreadyReversed:
+        raise HTTPException(status_code=409, detail="payment already reversed")
+    if result is None:
+        raise HTTPException(status_code=404, detail="payment not found")
+    snapshot, replayed = result
+    if replayed:
+        response.headers["X-Idempotency-Replay"] = "true"
+    return snapshot
 
 def main() -> None:
     parser = argparse.ArgumentParser()
