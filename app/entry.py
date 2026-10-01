@@ -27,6 +27,11 @@ class OrderIn(BaseModel):
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
 
+
+class ReversalIn(BaseModel):
+    reversal_id: str = Field(min_length=1)
+    request_fingerprint: str = Field(min_length=1)
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -72,12 +77,42 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
+        registered = orders.add_payment(x_tenant, order_id, body.amount_cents)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error))
-    if order is None:
+    if registered is None:
         raise HTTPException(status_code=404, detail="order not found")
-    return order
+    order, payment_id = registered
+    # payment_id 由服务分配，随登记结果可回读；同租户内唯一且稳定不变。
+    return {"payment_id": payment_id, **order}
+
+
+@app.post("/payments/{payment_id}/reversals")
+def reverse_payment(payment_id: str, body: ReversalIn, response: Response, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result, replayed = orders.reverse_payment(
+            x_tenant,
+            payment_id,
+            body.reversal_id,
+            body.request_fingerprint,
+        )
+    except orders.ReversalFingerprintConflict:
+        # 冲正标识被复用给不同业务内容：与收款已处理（409）明确区分。
+        raise HTTPException(
+            status_code=422,
+            detail="reversal id reused with a different request fingerprint",
+        )
+    except orders.PaymentAlreadyReversed:
+        # 冲正不可再被冲正：对已冲正收款再次冲正按已处理拒绝。
+        raise HTTPException(status_code=409, detail="payment already reversed")
+    if result is None:
+        # 含跨租户：不存在的收款一律按不存在处理，不改变订单与收款。
+        raise HTTPException(status_code=404, detail="payment not found")
+    if replayed:
+        response.headers["X-Idempotency-Replay"] = "true"
+    return result
 
 def main() -> None:
     parser = argparse.ArgumentParser()
