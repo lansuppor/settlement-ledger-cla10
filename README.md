@@ -29,7 +29,10 @@
   - `outstanding_cents = amount_cents - paid_cents`：未收金额
   - `net_cents = paid_cents - refunded_cents`：净额
   - `status`：`accepted`（受理/部分结算）、`settled`（净额等于订单金额）、`open`（曾收款且净额回到零）
-- `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单汇总。
+- `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单汇总。订单存在收款计划时，一次登记金额必须等于从当前未收讫期次起若干个连续期次的剩余金额合计（一次收满一期或多期，不留零头），否则返回 409 且订单与各期进度均不改变。
+- `POST /orders/{order_id}/payment-plan`：为未收到任何款项的订单建立分期收款计划（201）。请求体 `{"items": [{"term_id": "...", "amount_cents": n}, ...]}`：期次标识在订单内唯一、每期金额大于零、全部期次金额之和必须等于订单金额，币种沿用订单。已登记收款的订单（`order_state`）、重复建立（`plan_exists`）、期次重复或合计不等（`invalid_plan`）一律返回 409 整体拒绝，不写入任何期次；订单不存在或跨租户返回 404。建立计划不改变订单的未收金额、已收金额与状态。
+- `DELETE /orders/{order_id}/payment-plan`：取消收款计划，仅限订单未收到任何款项时（否则 409 `order_state`；无计划时 409 `plan_not_found`）。取消后订单回到无计划状态，可重新建立；成功返回 200 与订单汇总。
+- `GET /orders/{order_id}/payment-plan`：查询收款计划与各期收讫进度。返回每期 `term_id`、`amount_cents`、`paid_cents`、`settled`，以及订单整体 `planned_cents`（已计划金额）与 `settled_count`（已收讫期数）；订单不存在、跨租户或无计划返回 404。
 - `POST /orders/{order_id}/refunds`：受理退款单。请求字段 `refund_request_id`（客户端提供的请求去重标识，租户内唯一，与订单标识、退款单标识三者分离）、`amount_cents`（最小货币单位整数，必须大于零，币种沿用订单）。
   - 首次受理：201，创建状态为 `accepted` 的退款单，金额计入订单 `pending_refund_cents` 占用。
   - 同租户同 `refund_request_id` 同内容重放：200，返回首次受理的退款单，不重复占额。
@@ -59,9 +62,19 @@ curl -s -XPOST localhost:8000/refunds/<refund_id>/reject $T -H 'Content-Type: ap
   -d '{"reason_code":"internal_error"}'
 curl -s localhost:8000/orders/o1 $T
 curl -s localhost:8000/orders/o1/refunds $T
+
+# 分期收款计划：仅未收款订单可建立，期次金额合计须等于订单金额
+curl -s -XPOST localhost:8000/orders/o2/payment-plan $T -H 'Content-Type: application/json' \
+  -d '{"items":[{"term_id":"q1","amount_cents":600},{"term_id":"q2","amount_cents":400}]}'
+# 有计划的订单按期收款：一次须收满一个或多个连续期次（600、或 1000，不可 500）
+curl -s -XPOST localhost:8000/orders/o2/payments $T -H 'Content-Type: application/json' \
+  -d '{"amount_cents":600}'
+# 查询各期收讫进度；未收款前也可 DELETE 取消计划后重建
+curl -s localhost:8000/orders/o2/payment-plan $T
+curl -s -XDELETE localhost:8000/orders/o2/payment-plan $T
 ```
 
-收款/退款交替后，订单上的恒等式始终成立：`refunded_cents + pending_refund_cents ≤ paid_cents ≤ amount_cents`，`outstanding_cents = amount_cents − paid_cents`，`net_cents = paid_cents − refunded_cents`。
+收款/退款交替后，订单上的恒等式始终成立：`refunded_cents + pending_refund_cents ≤ paid_cents ≤ amount_cents`，`outstanding_cents = amount_cents − paid_cents`，`net_cents = paid_cents − refunded_cents`。存在收款计划时另有：已收金额等于已收讫各期金额之和，各期已收之和等于订单已收金额。
 
 ## 数据与配置
 
@@ -74,4 +87,4 @@ curl -s localhost:8000/orders/o1/refunds $T
 - 单进程运行，单库写入（写事务使用 `BEGIN IMMEDIATE` 串行化），未做连接池与写并发调优。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量导入只支持小样本同步方式。
-- 收款只支持整单登记，未实现分期与对账。
+- 收款计划仅支持整单一次性建立/取消，不支持计划执行中的变更与对账。

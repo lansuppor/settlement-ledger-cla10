@@ -4,8 +4,9 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, refunds
+from app.store import orders, plans, refunds
 from app.store.db import connect, migrate
+from app.store.plans import PlanError
 from app.store.refunds import REJECT_REASONS, RefundError
 
 app = FastAPI(title="settlement-ledger")
@@ -27,6 +28,13 @@ class RefundIn(BaseModel):
 class RejectIn(BaseModel):
     reason_code: str = Field(default="internal_error")
 
+class PlanItemIn(BaseModel):
+    term_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
+class PaymentPlanIn(BaseModel):
+    items: list[PlanItemIn] = Field(min_length=1)
+
 def _require_tenant(x_tenant: str) -> str:
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
@@ -36,6 +44,10 @@ def _refund_conflict(error: RefundError) -> HTTPException:
     detail: dict = {"code": error.reason_code, "message": str(error)}
     if error.refund is not None:
         detail["refund"] = error.refund
+    return HTTPException(status_code=409, detail=detail)
+
+def _plan_conflict(error: PlanError) -> HTTPException:
+    detail = {"code": error.reason_code, "message": str(error)}
     return HTTPException(status_code=409, detail=detail)
 
 @app.get("/health")
@@ -76,6 +88,40 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/orders/{order_id}/payment-plan", status_code=201)
+def create_payment_plan(
+    order_id: str, body: PaymentPlanIn, x_tenant: str = Header(default="")
+) -> dict:
+    tenant = _require_tenant(x_tenant)
+    try:
+        plan = plans.create_plan(
+            tenant, order_id, [(item.term_id, item.amount_cents) for item in body.items]
+        )
+    except PlanError as error:
+        raise _plan_conflict(error)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return plan
+
+@app.delete("/orders/{order_id}/payment-plan")
+def cancel_payment_plan(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    try:
+        cancelled = plans.cancel_plan(tenant, order_id)
+    except PlanError as error:
+        raise _plan_conflict(error)
+    if cancelled is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return orders.get(tenant, order_id)
+
+@app.get("/orders/{order_id}/payment-plan")
+def read_payment_plan(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    plan = plans.get_plan(tenant, order_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="payment plan not found")
+    return plan
 
 @app.post("/orders/{order_id}/refunds")
 def create_refund(

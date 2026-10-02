@@ -1,5 +1,6 @@
 import sqlite3
 
+from app.store import plans
 from app.store.db import connect
 
 
@@ -62,6 +63,12 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         if amount_cents <= 0 or new_paid > row["amount_cents"]:
             conn.execute("ROLLBACK")
             raise ValueError("payment exceeds outstanding amount")
+        try:
+            # With a plan, the amount must settle whole consecutive installments.
+            plans.apply_payment(conn, tenant, order_id, amount_cents)
+        except ValueError:
+            conn.execute("ROLLBACK")
+            raise
         status = derive_status(row["amount_cents"], new_paid, row["refunded_cents"])
         conn.execute(
             "UPDATE orders SET paid_cents=?, status=? WHERE tenant=? AND order_id=?",
