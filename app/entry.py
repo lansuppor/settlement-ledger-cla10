@@ -1,10 +1,12 @@
 import argparse
+
 from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
-from app.config import tenant_header
-from app.store import orders
-from app.store.db import connect, migrate
+
 from app.rules import order_rules
+from app.store import orders, refunds
+from app.store.db import connect, migrate
+from app.store.refunds import REJECT_REASONS, RefundError
 
 app = FastAPI(title="settlement-ledger")
 
@@ -16,6 +18,25 @@ class OrderIn(BaseModel):
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
+
+class RefundIn(BaseModel):
+    # Client-supplied dedup identity; deliberately separate from order_id/refund_id.
+    refund_request_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
+class RejectIn(BaseModel):
+    reason_code: str = Field(default="internal_error")
+
+def _require_tenant(x_tenant: str) -> str:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    return x_tenant
+
+def _refund_conflict(error: RefundError) -> HTTPException:
+    detail: dict = {"code": error.reason_code, "message": str(error)}
+    if error.refund is not None:
+        detail["refund"] = error.refund
+    return HTTPException(status_code=409, detail=detail)
 
 @app.get("/health")
 def health() -> dict:
@@ -38,10 +59,8 @@ def create_order(body: OrderIn) -> dict:
     return orders.get(body.tenant, body.order_id)
 
 @app.get("/orders/{order_id}")
-def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:
-    tenant = x_tenant or ""
-    if not tenant:
-        raise HTTPException(status_code=400, detail="tenant header is required")
+def read_order(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
     order = orders.get(tenant, order_id)
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
@@ -49,15 +68,74 @@ def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) ->
 
 @app.post("/orders/{order_id}/payments")
 def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
-    if not x_tenant:
-        raise HTTPException(status_code=400, detail="tenant header is required")
+    tenant = _require_tenant(x_tenant)
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
+        order = orders.add_payment(tenant, order_id, body.amount_cents)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error))
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/orders/{order_id}/refunds")
+def create_refund(
+    order_id: str, body: RefundIn, response: Response, x_tenant: str = Header(default="")
+) -> dict:
+    tenant = _require_tenant(x_tenant)
+    try:
+        refund, created = refunds.create_refund(
+            tenant, order_id, body.refund_request_id, body.amount_cents
+        )
+    except RefundError as error:
+        raise _refund_conflict(error)
+    if refund is None:
+        # Missing or foreign-tenant order: same answer, no existence leak.
+        raise HTTPException(status_code=404, detail="order not found")
+    response.status_code = 201 if created else 200
+    return refund
+
+@app.get("/orders/{order_id}/refunds")
+def list_refunds(order_id: str, x_tenant: str = Header(default="")) -> list[dict]:
+    tenant = _require_tenant(x_tenant)
+    rows = refunds.list_for_order(tenant, order_id)
+    if rows is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return rows
+
+@app.get("/refunds/{refund_id}")
+def read_refund(refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    refund, _order = refunds.get_refund(tenant, refund_id=refund_id)
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return refund
+
+@app.post("/refunds/{refund_id}/complete")
+def complete_refund(refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    try:
+        refund = refunds.complete_refund(tenant, refund_id)
+    except RefundError as error:
+        raise _refund_conflict(error)
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return refund
+
+@app.post("/refunds/{refund_id}/reject")
+def reject_refund(
+    refund_id: str, body: RejectIn, x_tenant: str = Header(default="")
+) -> dict:
+    tenant = _require_tenant(x_tenant)
+    if body.reason_code not in REJECT_REASONS:
+        allowed = ", ".join(sorted(REJECT_REASONS))
+        raise HTTPException(status_code=400, detail=f"reason_code must be one of: {allowed}")
+    try:
+        refund = refunds.reject_refund(tenant, refund_id, body.reason_code)
+    except RefundError as error:
+        raise _refund_conflict(error)
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return refund
 
 def main() -> None:
     parser = argparse.ArgumentParser()
