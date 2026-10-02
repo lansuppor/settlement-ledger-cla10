@@ -4,11 +4,15 @@ from app.store.db import connect
 from app.store.orders import derive_status
 from app.store.orders import get as get_order
 
-# Refund lifecycle: accepted -> completed | rejected
-#   accepted  : amount is held in orders.pending_refund_cents
-#   completed : hold moves into orders.refunded_cents and reduces order net
-#   rejected  : hold is released; reason_code records why
+# Refund lifecycle: accepted -> completed | rejected, accepted -> awaiting_supplement -> accepted
+#   accepted            : amount is held in orders.pending_refund_cents
+#   awaiting_supplement : returned for supplementary material; hold is kept, completion blocked
+#   completed           : hold moves into orders.refunded_cents and reduces order net
+#   rejected            : hold is released; reason_code records why
 REJECT_REASONS = {"amount_exceeds", "order_state", "request_conflict", "internal_error"}
+
+# Why the customer must supply supplementary material before processing continues.
+SUPPLEMENT_REASONS = {"missing_proof", "wrong_account", "amount_mismatch"}
 
 class RefundError(Exception):
     """A refusal that leaves every existing document untouched."""
@@ -172,6 +176,8 @@ def _transition(
         return _row_to_dict(row)
     if row["status"] in ("completed", "rejected"):
         raise RefundError("refund_final", f"refund is already {row['status']}")
+    if target == "completed" and row["status"] == "awaiting_supplement":
+        raise RefundError("refund_state", "refund is awaiting supplement and cannot complete")
 
     if target == "completed":
         order = conn.execute(
@@ -237,3 +243,168 @@ def reject_refund(tenant: str, refund_id: str, reason_code: str) -> dict | None:
     finally:
         conn.close()
     return get_refund(tenant, refund_id=refund_id)[0] or result
+
+_SUPPLEMENT_COLUMNS = (
+    "tenant, supplement_id, refund_id, kind, reason_code, note, "
+    "amount_before_cents, amount_after_cents, created_at"
+)
+
+def _supplement_row_to_dict(row) -> dict:
+    return {
+        "tenant": row["tenant"],
+        "supplement_id": row["supplement_id"],
+        "refund_id": row["refund_id"],
+        "kind": row["kind"],
+        "reason_code": row["reason_code"],
+        "note": row["note"],
+        "amount_before_cents": row["amount_before_cents"],
+        "amount_after_cents": row["amount_after_cents"],
+        "created_at": row["created_at"],
+    }
+
+def _insert_supplement(
+    conn, tenant: str, refund_id: str, kind: str,
+    reason_code: str, note: str, amount_before: int, amount_after: int,
+) -> None:
+    conn.execute(
+        "INSERT INTO refund_supplements(tenant, supplement_id, refund_id, kind, "
+        "reason_code, note, amount_before_cents, amount_after_cents) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (tenant, uuid.uuid4().hex, refund_id, kind,
+         reason_code, note, amount_before, amount_after),
+    )
+
+def _latest_supplement(conn, tenant: str, refund_id: str, kind: str | None = None):
+    sql = f"SELECT {_SUPPLEMENT_COLUMNS} FROM refund_supplements WHERE tenant=? AND refund_id=?"
+    params: list = [tenant, refund_id]
+    if kind is not None:
+        sql += " AND kind=?"
+        params.append(kind)
+    sql += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    return conn.execute(sql, params).fetchone()
+
+def return_for_supplement(
+    tenant: str, refund_id: str, reason_code: str, note: str
+) -> tuple[dict | None, bool]:
+    """Return an accepted refund for supplementary material. Returns (refund, created).
+
+    A refund already awaiting supplement replays the first return when reason and
+    note match; a different reason or note raises RefundError and leaves the first
+    return record untouched. Terminal refunds cannot be returned.
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _fetch_by_id(conn, tenant, refund_id)
+        if row is None:
+            conn.execute("ROLLBACK")
+            return None, False
+        if row["status"] == "awaiting_supplement":
+            first = _latest_supplement(conn, tenant, refund_id, kind="returned")
+            if first["reason_code"] == reason_code and first["note"] == note:
+                conn.execute("ROLLBACK")
+                return _row_to_dict(row), False
+            conn.execute("ROLLBACK")
+            raise RefundError(
+                "request_conflict",
+                "refund was already returned for supplement with different content",
+                refund=_row_to_dict(row),
+            )
+        if row["status"] != "accepted":
+            conn.execute("ROLLBACK")
+            raise RefundError("refund_final", f"refund is already {row['status']}")
+        conn.execute(
+            "UPDATE refunds SET status='awaiting_supplement', "
+            "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE tenant=? AND refund_id=?",
+            (tenant, refund_id),
+        )
+        # The hold is kept while waiting; before/after amounts are equal here.
+        _insert_supplement(
+            conn, tenant, refund_id, "returned",
+            reason_code, note, row["amount_cents"], row["amount_cents"],
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return get_refund(tenant, refund_id=refund_id)[0], True
+
+def supplement_refund(tenant: str, refund_id: str, amount_cents: int) -> dict | None:
+    """Accept the supplemented amount and move the refund back to accepted.
+
+    The hold is recomputed to the new amount in the same transaction; a smaller
+    amount releases the excess immediately. Conservation is checked with this
+    refund's current hold still counted: refunded + pending + new <= paid.
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _fetch_by_id(conn, tenant, refund_id)
+        if row is None:
+            conn.execute("ROLLBACK")
+            return None
+        if row["status"] in ("completed", "rejected"):
+            conn.execute("ROLLBACK")
+            raise RefundError("refund_final", f"refund is already {row['status']}")
+        if row["status"] != "awaiting_supplement":
+            # Replay of a supplement that already went through: same amount on a
+            # refund whose latest event is that supplement returns the same result.
+            latest = _latest_supplement(conn, tenant, refund_id)
+            if (
+                latest is not None
+                and latest["kind"] == "supplemented"
+                and latest["amount_after_cents"] == amount_cents
+            ):
+                conn.execute("ROLLBACK")
+                return _row_to_dict(row)
+            conn.execute("ROLLBACK")
+            raise RefundError("refund_state", "refund is not awaiting supplement")
+        if amount_cents <= 0:
+            conn.execute("ROLLBACK")
+            raise RefundError("amount_exceeds", "supplement amount must be greater than zero")
+
+        order = conn.execute(
+            "SELECT paid_cents, refunded_cents, pending_refund_cents FROM orders "
+            "WHERE tenant=? AND order_id=?",
+            (tenant, row["order_id"]),
+        ).fetchone()
+        # Conservation with this refund's hold still counted on the books.
+        held = order["refunded_cents"] + order["pending_refund_cents"]
+        if held + amount_cents > order["paid_cents"]:
+            conn.execute("ROLLBACK")
+            raise RefundError("amount_exceeds", "refund exceeds the paid amount of the order")
+
+        returned = _latest_supplement(conn, tenant, refund_id, kind="returned")
+        old_amount = row["amount_cents"]
+        conn.execute(
+            "UPDATE orders SET pending_refund_cents = pending_refund_cents - ? + ? "
+            "WHERE tenant=? AND order_id=?",
+            (old_amount, amount_cents, tenant, row["order_id"]),
+        )
+        conn.execute(
+            "UPDATE refunds SET status='accepted', amount_cents=?, "
+            "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE tenant=? AND refund_id=?",
+            (amount_cents, tenant, refund_id),
+        )
+        _insert_supplement(
+            conn, tenant, refund_id, "supplemented",
+            returned["reason_code"], returned["note"], old_amount, amount_cents,
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return get_refund(tenant, refund_id=refund_id)[0]
+
+def list_supplements(tenant: str, refund_id: str) -> list[dict] | None:
+    """Lists supplement records for a refund, newest first. None means invisible."""
+    if get_refund(tenant, refund_id=refund_id)[0] is None:
+        return None
+    conn = connect()
+    try:
+        rows = conn.execute(
+            f"SELECT {_SUPPLEMENT_COLUMNS} FROM refund_supplements "
+            "WHERE tenant=? AND refund_id=? ORDER BY created_at DESC, rowid DESC",
+            (tenant, refund_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_supplement_row_to_dict(row) for row in rows]

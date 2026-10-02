@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款、退款单受理/完成/拒绝，并核对未收金额与净额；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款、退款单受理/退回补件/完成/拒绝，并核对未收金额与净额；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -41,8 +41,11 @@
   - 订单不存在、不属于本租户：404；订单状态为 `rejected`：409，`detail.code = order_state`。
 - `GET /orders/{order_id}/refunds`：查询订单的退款单列表；订单不可见时 404。
 - `GET /refunds/{refund_id}`：按退款单标识查询退款单；不存在或跨租户返回 404。
-- `POST /refunds/{refund_id}/complete`：完成退款单。占用额转入 `refunded_cents`，订单净额与状态随之更新；重复完成幂等返回 200；已拒绝的退款单返回 409。
-- `POST /refunds/{refund_id}/reject`：拒绝退款单并释放占用额。请求体 `{"reason_code": "..."}`，取值 `amount_exceeds`、`order_state`、`request_conflict`、`internal_error`（拒绝与内部错误使用不同码，不混为一类；默认 `internal_error`）。
+- `POST /refunds/{refund_id}/complete`：完成退款单。占用额转入 `refunded_cents`，订单净额与状态随之更新；重复完成幂等返回 200；已拒绝的退款单返回 409；处于 `awaiting_supplement` 的退款单不能完成，返回 409。
+- `POST /refunds/{refund_id}/reject`：拒绝退款单并释放占用额。请求体 `{"reason_code": "..."}`，取值 `amount_exceeds`、`order_state`、`request_conflict`、`internal_error`（拒绝与内部错误使用不同码，不混为一类；默认 `internal_error`）。`awaiting_supplement` 状态的退款单可以拒绝，释放其当前占用额。
+- `POST /refunds/{refund_id}/return`：退回补件。仅限 `accepted` 状态的退款单；请求体 `{"reason_code": "...", "note": "..."}`，`reason_code` 取值 `missing_proof`、`wrong_account`、`amount_mismatch`（其他值 400），`note` 为非空说明。成功（201）后退款单进入 `awaiting_supplement`，占用额保持不变；`awaiting_supplement` 下以同事由同说明重复发起视为重放（200，不新增记录），事由或说明不同返回 409（`request_conflict`）且首次退回记录不被改写；已完成/已拒绝的退款单返回 409。
+- `POST /refunds/{refund_id}/supplement`：补件通过并提交新的退款金额。请求体 `{"amount_cents": n}`，必须为大于零的整数，币种沿用订单。守恒校验在计入本单当前占用的前提下进行：已退 + 未决 + 本次 ≤ 累计已收，不满足返回 409（`amount_exceeds`）且订单与退款单均不改变。成功（200）后退款单回到 `accepted`，占用额按新金额重算（新金额小于原占用额时超出部分立即释放）；非 `awaiting_supplement` 状态返回 409，相同金额的重放返回与首次一致的结果。
+- `GET /refunds/{refund_id}/supplements`：查询退款单的退回补件记录，最新在前。每条含 `kind`（`returned` 退回 / `supplemented` 补件通过）、`reason_code`、`note`、`amount_before_cents`、`amount_after_cents`、`created_at`；退款单不存在或跨租户返回 404。
 - `GET /health`：返回服务与数据库状态。
 
 ### 调用示例
@@ -60,6 +63,15 @@ curl -s -XPOST localhost:8000/orders/o1/refunds $T -H 'Content-Type: application
 curl -s -XPOST localhost:8000/refunds/<refund_id>/complete $T
 curl -s -XPOST localhost:8000/refunds/<refund_id>/reject $T -H 'Content-Type: application/json' \
   -d '{"reason_code":"internal_error"}'
+
+# 退回补件：accepted 的退款单退回给客户补件，进入 awaiting_supplement
+curl -s -XPOST localhost:8000/refunds/<refund_id>/return $T -H 'Content-Type: application/json' \
+  -d '{"reason_code":"missing_proof","note":"请补充付款凭证"}'
+# 补件通过：提交新的退款金额，退款单回到 accepted 并按新金额重算占用
+curl -s -XPOST localhost:8000/refunds/<refund_id>/supplement $T -H 'Content-Type: application/json' \
+  -d '{"amount_cents":260}'
+# 查询退回/补件记录（最新在前）
+curl -s localhost:8000/refunds/<refund_id>/supplements $T
 curl -s localhost:8000/orders/o1 $T
 curl -s localhost:8000/orders/o1/refunds $T
 

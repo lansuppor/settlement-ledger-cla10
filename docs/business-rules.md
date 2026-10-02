@@ -22,10 +22,13 @@
 - 同一（租户, 退款请求标识）重复提交：
   - 内容（订单、金额）与首次一致：返回首次受理的退款单，不重复受理、不重复占额（首次 201，重放 200）。
   - 内容与首次不同（指向不同订单或不同金额）：以 request_conflict 拒绝，首次单据的金额与状态不得被改写。
-- 退款单生命周期：accepted（受理）→ completed（完成）/ rejected（拒绝）。
+- 退款单生命周期：accepted（受理）→ completed（完成）/ rejected（拒绝）；accepted ↔ awaiting_supplement（退回补件）。
   - 受理：金额计入订单的未决退款占用 pending_refund_cents，并阻止会破坏守恒的后续退款。
-  - 完成：占用额转入累计已退 refunded_cents，冲减净额并按净额更新订单状态。
-  - 拒绝：释放未决占用；必须记录可区分的拒绝原因码：amount_exceeds（金额超限）、order_state（订单状态不允许）、request_conflict（请求冲突）、internal_error（内部错误）。拒绝与内部错误不得混为一类。
+  - 退回补件：仅 accepted 可退回，须给出补件事由码（missing_proof、wrong_account、amount_mismatch）与非空说明；退回后占用额保持，单据进入 awaiting_supplement。同事由同说明的重复退回视为重放，不新增记录；事由或说明不同以 request_conflict 拒绝且首次退回记录不得改写。已完成/已拒绝的退款单不得退回。
+  - 补件通过：仅 awaiting_supplement 可提交新金额（大于零的整数，币种沿用订单）；在计入本单占用的前提下校验 已退 + 未决 + 本次 ≤ 累计已收，不满足整体拒绝。通过后回到 accepted，占用额按新金额重算，小于原占用额的部分立即释放；相同金额的重放返回与首次一致的结果。
+  - 每次退回与补件通过都留下记录（事由码、说明、前后金额、发生时间），可按退款单标识查询，最新在前。
+  - 完成：占用额转入累计已退 refunded_cents，冲减净额并按净额更新订单状态；awaiting_supplement 的单据不得完成。
+  - 拒绝：释放未决占用；必须记录可区分的拒绝原因码：amount_exceeds（金额超限）、order_state（订单状态不允许）、request_conflict（请求冲突）、internal_error（内部错误）。拒绝与内部错误不得混为一类。awaiting_supplement 的单据可以拒绝，释放其当前占用额。
   - 完成/拒绝均为终态；对终态单据重复调用完成（或拒绝）按幂等重放处理，跨终态迁移被拒绝。
 
 ## 金额守恒
