@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders
+from app.store import batches, orders
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -30,6 +30,14 @@ class PaymentIn(BaseModel):
 class ReversalIn(BaseModel):
     reversal_id: str = Field(min_length=1)
     request_fingerprint: str = Field(min_length=1)
+
+class BatchOrdersIn(BaseModel):
+    # 批次标识与批次请求指纹均为非空字符串：缺失（含空串）由参数校验统一按 400 拒绝，不落任何数据。
+    batch_id: str = Field(min_length=1)
+    request_fingerprint: str = Field(min_length=1)
+    # 行内字段不在这里做严格校验：行内缺幂等键/指纹等属于“行级拒绝”，只影响本行，
+    # 不能让一行字段问题把整批打成 400。行校验在存储层逐行完成。
+    lines: list[object] = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -60,6 +68,26 @@ def create_order(body: OrderIn, response: Response) -> dict:
     if replayed:
         response.headers["X-Idempotency-Replay"] = "true"
     return order
+
+@app.post("/orders/batch", status_code=200)
+def accept_orders_batch(body: BatchOrdersIn, response: Response) -> dict:
+    # 每行携带租户（字段与单笔受理一致）；批次以首行租户作为（租户, 批次标识）的租户范围。
+    first_tenant = body.lines[0].get("tenant") if isinstance(body.lines[0], dict) else None
+    if not isinstance(first_tenant, str) or not first_tenant:
+        # 批次无法确定租户范围：按参数不合法拒绝，不落任何数据。
+        raise HTTPException(status_code=400, detail="tenant is required in each order line")
+    try:
+        manifest = batches.accept_batch(first_tenant, body.batch_id, body.request_fingerprint, body.lines)
+    except batches.BatchFingerprintConflict:
+        # 批次标识被复用于不同批次指纹：与行级指纹冲突、订单重复明确区分。
+        raise HTTPException(
+            status_code=422, detail="batch id reused with a different batch request fingerprint"
+        )
+    except batches.BatchShapeError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    if manifest["replayed"]:
+        response.headers["X-Idempotency-Replay"] = "true"
+    return manifest
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:

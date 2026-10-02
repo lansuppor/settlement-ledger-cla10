@@ -36,51 +36,76 @@ def accept_order(
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        recorded = conn.execute(
-            "SELECT request_fingerprint, response_snapshot FROM accepted_requests "
-            "WHERE tenant=? AND idempotency_key=?",
-            (tenant, idempotency_key),
-        ).fetchone()
-        if recorded is not None:
-            # 幂等键已消费：只比对指纹，绝不改写首次受理的任何记录。
+        try:
+            order, replayed = _accept_order_locked(
+                conn, tenant, idempotency_key, request_fingerprint, order_id, amount_cents, currency
+            )
+        except Exception:
             conn.execute("ROLLBACK")
-            if recorded["request_fingerprint"] != request_fingerprint:
-                raise FingerprintConflict
-            return json.loads(recorded["response_snapshot"]), True
-
-        if conn.execute(
-            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
-            (tenant, order_id),
-        ).fetchone() is not None:
-            conn.execute("ROLLBACK")
-            raise OrderAlreadyAccepted
-
-        conn.execute(
-            "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) "
-            "VALUES(?,?,?,0,?,'accepted')",
-            (tenant, order_id, amount_cents, currency),
-        )
-        order = {
-            "tenant": tenant,
-            "order_id": order_id,
-            "amount_cents": amount_cents,
-            "paid_cents": 0,
-            "currency": currency,
-            "status": "accepted",
-            "outstanding_cents": amount_cents,
-        }
-        conn.execute(
-            "INSERT INTO accepted_requests(tenant, idempotency_key, request_fingerprint, order_id, response_snapshot) "
-            "VALUES(?,?,?,?,?)",
-            (tenant, idempotency_key, request_fingerprint, order_id, json.dumps(order, ensure_ascii=False)),
-        )
-        if os.environ.get("APP_CRASH_BEFORE_COMMIT") == "1":
+            raise
+        if not replayed and os.environ.get("APP_CRASH_BEFORE_COMMIT") == "1":
             # 崩溃演练：不提交直接硬退出，未提交事务随连接被丢弃。
             os._exit(2)
         conn.execute("COMMIT")
-        return order, False
+        return order, replayed
     finally:
         conn.close()
+
+
+def _accept_order_locked(
+    conn: sqlite3.Connection,
+    tenant: str,
+    idempotency_key: str,
+    request_fingerprint: str,
+    order_id: str,
+    amount_cents: int,
+    currency: str,
+) -> tuple[dict, bool]:
+    """单笔受理规则（调用方已持有 BEGIN IMMEDIATE 事务，提交/回滚由调用方负责）。
+
+    批量受理逐行复用本函数，保证行级判定与单笔入口完全一致：
+      - 同键同指纹：返回（首次订单快照, True），不写任何数据；
+      - 同键不同指纹：抛 FingerprintConflict（尚未发生任何写入）；
+      - 订单标识重复：抛 OrderAlreadyAccepted（尚未发生任何写入）；
+      - 首次：在当前事务内写入订单与幂等记录，返回（订单对象, False）。
+    """
+    recorded = conn.execute(
+        "SELECT request_fingerprint, response_snapshot FROM accepted_requests "
+        "WHERE tenant=? AND idempotency_key=?",
+        (tenant, idempotency_key),
+    ).fetchone()
+    if recorded is not None:
+        # 幂等键已消费：只比对指纹，绝不改写首次受理的任何记录。
+        if recorded["request_fingerprint"] != request_fingerprint:
+            raise FingerprintConflict
+        return json.loads(recorded["response_snapshot"]), True
+
+    if conn.execute(
+        "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+        (tenant, order_id),
+    ).fetchone() is not None:
+        raise OrderAlreadyAccepted
+
+    conn.execute(
+        "INSERT INTO orders(tenant, order_id, amount_cents, paid_cents, currency, status) "
+        "VALUES(?,?,?,0,?,'accepted')",
+        (tenant, order_id, amount_cents, currency),
+    )
+    order = {
+        "tenant": tenant,
+        "order_id": order_id,
+        "amount_cents": amount_cents,
+        "paid_cents": 0,
+        "currency": currency,
+        "status": "accepted",
+        "outstanding_cents": amount_cents,
+    }
+    conn.execute(
+        "INSERT INTO accepted_requests(tenant, idempotency_key, request_fingerprint, order_id, response_snapshot) "
+        "VALUES(?,?,?,?,?)",
+        (tenant, idempotency_key, request_fingerprint, order_id, json.dumps(order, ensure_ascii=False)),
+    )
+    return order, False
 
 
 def get(tenant: str, order_id: str) -> dict | None:
