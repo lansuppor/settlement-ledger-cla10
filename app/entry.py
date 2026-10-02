@@ -4,8 +4,9 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, refunds
+from app.store import orders, plans, refunds
 from app.store.db import connect, migrate
+from app.store.plans import PlanError
 from app.store.refunds import REJECT_REASONS, RefundError
 
 app = FastAPI(title="settlement-ledger")
@@ -18,6 +19,13 @@ class OrderIn(BaseModel):
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
+
+class InstallmentIn(BaseModel):
+    installment_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
+class PlanIn(BaseModel):
+    installments: list[InstallmentIn] = Field(min_length=1)
 
 class RefundIn(BaseModel):
     # Client-supplied dedup identity; deliberately separate from order_id/refund_id.
@@ -73,6 +81,43 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
         order = orders.add_payment(tenant, order_id, body.amount_cents)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error))
+    if order is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return order
+
+def _plan_conflict(error: PlanError) -> HTTPException:
+    return HTTPException(status_code=409, detail={"code": error.reason_code, "message": str(error)})
+
+@app.post("/orders/{order_id}/payment-plan", status_code=201)
+def create_payment_plan(
+    order_id: str, body: PlanIn, x_tenant: str = Header(default="")
+) -> dict:
+    tenant = _require_tenant(x_tenant)
+    installments = [(item.installment_id, item.amount_cents) for item in body.installments]
+    try:
+        plan = plans.create_plan(tenant, order_id, installments)
+    except PlanError as error:
+        raise _plan_conflict(error)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return plan
+
+@app.get("/orders/{order_id}/payment-plan")
+def read_payment_plan(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    plan = plans.get_plan(tenant, order_id)
+    if plan is None:
+        # Missing/foreign order and order without a plan share one answer.
+        raise HTTPException(status_code=404, detail="payment plan not found")
+    return plan
+
+@app.delete("/orders/{order_id}/payment-plan")
+def cancel_payment_plan(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    try:
+        order = plans.cancel_plan(tenant, order_id)
+    except PlanError as error:
+        raise _plan_conflict(error)
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order

@@ -1,5 +1,6 @@
 import sqlite3
 
+from app.store import plans
 from app.store.db import connect
 
 
@@ -62,6 +63,14 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         if amount_cents <= 0 or new_paid > row["amount_cents"]:
             conn.execute("ROLLBACK")
             raise ValueError("payment exceeds outstanding amount")
+        # When a plan exists the money must land on whole consecutive
+        # installments; a rejected distribution rolls back together with the
+        # (not yet applied) order update, so no installment or order moves.
+        try:
+            plans.apply_payment_to_plan(conn, tenant, order_id, amount_cents)
+        except plans.PlanError as error:
+            conn.execute("ROLLBACK")
+            raise ValueError(str(error))
         status = derive_status(row["amount_cents"], new_paid, row["refunded_cents"])
         conn.execute(
             "UPDATE orders SET paid_cents=?, status=? WHERE tenant=? AND order_id=?",
