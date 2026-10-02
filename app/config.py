@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+
 def db_path() -> Path:
     return Path(os.environ.get("APP_DB", "var/app.sqlite"))
 
