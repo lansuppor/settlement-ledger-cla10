@@ -7,7 +7,7 @@ from app.rules import order_rules
 from app.store import orders, plans, refunds
 from app.store.db import connect, migrate
 from app.store.plans import PlanError
-from app.store.refunds import REJECT_REASONS, RefundError
+from app.store.refunds import REJECT_REASONS, SUPPLEMENT_REASONS, RefundError
 
 app = FastAPI(title="settlement-ledger")
 
@@ -27,6 +27,13 @@ class RefundIn(BaseModel):
 
 class RejectIn(BaseModel):
     reason_code: str = Field(default="internal_error")
+
+class SupplementReturnIn(BaseModel):
+    reason_code: str
+    note: str
+
+class SupplementIn(BaseModel):
+    amount_cents: int = Field(gt=0)
 
 class PlanItemIn(BaseModel):
     term_id: str = Field(min_length=1)
@@ -182,6 +189,51 @@ def reject_refund(
     if refund is None:
         raise HTTPException(status_code=404, detail="refund not found")
     return refund
+
+@app.post("/refunds/{refund_id}/supplement-return")
+def return_refund_for_supplement(
+    refund_id: str, body: SupplementReturnIn, response: Response,
+    x_tenant: str = Header(default=""),
+) -> dict:
+    tenant = _require_tenant(x_tenant)
+    note = body.note.strip()
+    if body.reason_code not in SUPPLEMENT_REASONS or not note:
+        allowed = ", ".join(sorted(SUPPLEMENT_REASONS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"reason_code must be one of: {allowed}; note must be non-empty",
+        )
+    try:
+        refund, returned = refunds.return_for_supplement(tenant, refund_id, body.reason_code, note)
+    except RefundError as error:
+        raise _refund_conflict(error)
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    response.status_code = 201 if returned else 200
+    return refund
+
+@app.post("/refunds/{refund_id}/supplement")
+def supplement_refund(
+    refund_id: str, body: SupplementIn, response: Response,
+    x_tenant: str = Header(default=""),
+) -> dict:
+    tenant = _require_tenant(x_tenant)
+    try:
+        refund, accepted = refunds.submit_supplement(tenant, refund_id, body.amount_cents)
+    except RefundError as error:
+        raise _refund_conflict(error)
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    response.status_code = 201 if accepted else 200
+    return refund
+
+@app.get("/refunds/{refund_id}/supplements")
+def list_refund_supplements(refund_id: str, x_tenant: str = Header(default="")) -> list[dict]:
+    tenant = _require_tenant(x_tenant)
+    events = refunds.list_supplement_events(tenant, refund_id)
+    if events is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return events
 
 def main() -> None:
     parser = argparse.ArgumentParser()

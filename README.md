@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款、退款单受理/完成/拒绝，并核对未收金额与净额；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款、退款单受理/退回补件/补件提交/完成/拒绝，并核对未收金额与净额；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -39,10 +39,18 @@
   - 同租户同 `refund_request_id` 但订单或金额不同：409，`detail.code = request_conflict`，首次单据不被改写。
   - 金额使“已退 + 未决 + 本次”超过累计已收：409，`detail.code = amount_exceeds`，整体拒绝、无半生效状态。
   - 订单不存在、不属于本租户：404；订单状态为 `rejected`：409，`detail.code = order_state`。
-- `GET /orders/{order_id}/refunds`：查询订单的退款单列表；订单不可见时 404。
-- `GET /refunds/{refund_id}`：按退款单标识查询退款单；不存在或跨租户返回 404。
-- `POST /refunds/{refund_id}/complete`：完成退款单。占用额转入 `refunded_cents`，订单净额与状态随之更新；重复完成幂等返回 200；已拒绝的退款单返回 409。
-- `POST /refunds/{refund_id}/reject`：拒绝退款单并释放占用额。请求体 `{"reason_code": "..."}`，取值 `amount_exceeds`、`order_state`、`request_conflict`、`internal_error`（拒绝与内部错误使用不同码，不混为一类；默认 `internal_error`）。
+- `GET /orders/{order_id}/refunds`：查询订单的退款单列表；订单不可见时 404。每张退款单含 `status` 与 `held_cents`（当前占用额：`accepted`/`awaiting_supplement` 时等于退款金额，终态为 0）。
+- `GET /refunds/{refund_id}`：按退款单标识查询退款单；不存在或跨租户返回 404。返回体含当前状态 `status` 与当前占用额 `held_cents`。
+- `POST /refunds/{refund_id}/complete`：完成退款单。占用额转入 `refunded_cents`，订单净额与状态随之更新；重复完成幂等返回 200；已拒绝的退款单返回 409；处于 `awaiting_supplement` 的退款单不能完成，返回 409（`detail.code = refund_state`）。
+- `POST /refunds/{refund_id}/reject`：拒绝退款单并释放占用额。请求体 `{"reason_code": "..."}`，取值 `amount_exceeds`、`order_state`、`request_conflict`、`internal_error`（拒绝与内部错误使用不同码，不混为一类；默认 `internal_error`）。在 `awaiting_supplement` 状态也可拒绝，按当前金额释放占用。
+- `POST /refunds/{refund_id}/supplement-return`：把状态为 `accepted` 的退款单退回客户补件。请求体 `{"reason_code": "missing_proof|wrong_account|amount_mismatch", "note": "非空说明"}`。成功 201，退款单进入 `awaiting_supplement`，占用额不变并写一条 `returned` 记录。
+  - 等待补件期间以完全相同的事由码与说明重复发起：视为同一操作重放，200 返回同一退款单，不新增记录。
+  - 事由码或说明与首次不同：409，`detail.code = supplement_conflict`，首次退回记录不被改写。
+  - 已完成或已拒绝的退款单退回补件：409（`detail.code = refund_final`）；退款单不存在或跨租户：404。
+- `POST /refunds/{refund_id}/supplement`：补件完成后提交新的退款金额继续审核。请求体 `{"amount_cents": n}`，`n` 必须为大于零的整数，币种沿用订单。成功 201，退款单回到 `accepted`，按新金额重算本单占用（小于原占用立即释放超出部分，大于原占用在守恒允许范围内追加占用），并写一条 `supplemented` 记录（含补件前后金额）。
+  - 守恒校验在计入本单占用的前提下进行：将本单占用替换为新金额后，`已退 + 未决` 不得超过累计已收；不满足返回 409，`detail.code = amount_exceeds`，退款单仍停留在 `awaiting_supplement`，金额、占用与记录均不改变。
+  - 补件通过后以相同新金额重复提交：幂等重放，200 返回同一退款单，不新增记录；以不同金额再次提交：409。
+- `GET /refunds/{refund_id}/supplements`：按退款单标识查询退回补件/补件通过记录，最新记录排在前。每条记录含 `event_type`（`returned`/`supplemented`）、`reason_code`、`note`、`amount_before_cents`、`amount_after_cents`、`created_at`；退款单不存在或跨租户返回 404。
 - `GET /health`：返回服务与数据库状态。
 
 ### 调用示例
@@ -60,6 +68,15 @@ curl -s -XPOST localhost:8000/orders/o1/refunds $T -H 'Content-Type: application
 curl -s -XPOST localhost:8000/refunds/<refund_id>/complete $T
 curl -s -XPOST localhost:8000/refunds/<refund_id>/reject $T -H 'Content-Type: application/json' \
   -d '{"reason_code":"internal_error"}'
+# 退回补件：accepted -> awaiting_supplement（占用保留；同事由同说明重放返回 200）
+curl -s -XPOST localhost:8000/refunds/<refund_id>/supplement-return $T \
+  -H 'Content-Type: application/json' \
+  -d '{"reason_code":"missing_proof","note":"缺少打款凭证，请补件"}'
+# 补件完成后提交新金额：awaiting_supplement -> accepted，占用按新金额重算
+curl -s -XPOST localhost:8000/refunds/<refund_id>/supplement $T \
+  -H 'Content-Type: application/json' -d '{"amount_cents":200}'
+# 查询退回/补件记录（最新在前）
+curl -s localhost:8000/refunds/<refund_id>/supplements $T
 curl -s localhost:8000/orders/o1 $T
 curl -s localhost:8000/orders/o1/refunds $T
 
